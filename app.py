@@ -1,109 +1,109 @@
-from typing import Optional, List, Dict, Any, Union
-from pydantic import BaseModel, Field
-from langgraph.graph import StateGraph, END
-from langchain_core.tools import tool
-from datetime import datetime
-from nexhealth_client import NexHealthClient
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
 import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Union
+
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, StateGraph
+from nexhealth_client import NexHealthClient  
+from pydantic import BaseModel, Field
+
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0) 
 
 
 class AppointmentState(BaseModel):
+    """The complete state for the appointment booking process."""
     messages: List[Dict[str, Any]] = Field(default_factory=list)
+    
+    # Patient Info
     name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
     phone_number: Optional[str] = None
-    dob: Optional[str] = None
+    dob: Optional[str] = None 
+    
+    # Patient Status
     patient_id: Optional[str] = None
-    location: Optional[int] = None
-    provider: Optional[int] = None
-    operatory_id: Optional[int] = None
-    slot_time: Optional[str] = None
-    appointment_type_id: Optional[int] = None
     is_existing_patient: Optional[bool] = None
     upcoming_appt_id: Optional[int] = None
 
+    # Appointment Details
+    location: Optional[int] = None
+    location_name: Optional[str] = None
+    provider: Optional[int] = None
+    provider_name: Optional[str] = None
+    operatory_id: Optional[int] = None
+    slot_time: Optional[str] = None
+    appointment_type_id: int = 1  
 
-@tool
-def info_getter(name: str, phone_number: str, dob: str) -> dict:
-    """Extract name, phone_number, and dob from user input."""
-    return {"name": name, "phone_number": phone_number, "dob": dob}
+
+    location_options: List[Dict] = Field(default_factory=list)
+    provider_options: List[Dict] = Field(default_factory=list)
+    slot_options: List[Dict] = Field(default_factory=list)
+
 
 
 @tool
 def search_patient(name: str, phone_number: str, dob: str, location_id: int = 331668) -> Union[str, List[dict]]:
-    """Search for a patient by name, phone, dob, and location."""
+    """
+    Search for an existing patient by name, phone, dob, and location.
+    This is called *after* collecting the user's basic info.
+    """
     client = NexHealthClient()
     return client.search_patients(name, phone_number, dob, location_id)
 
-
 @tool
 def get_locations() -> List[dict]:
-    """Fetch all available locations from NexHealth."""
+    """Fetch all available practice locations."""
     return NexHealthClient().get_locations()
-
 
 @tool
 def get_providers(location_id: int) -> List[dict]:
-    """Get list of providers for a given location_id."""
+    """Get a list of providers (doctors) for a given location_id."""
     return NexHealthClient().get_providers(location_id)
 
-
 @tool
-def get_slots(start_date: str, days: int, location_ids: List[int], provider_ids: List[int]) -> List[dict]:
-    """Fetch available appointment slots."""
+def get_slots(location_ids: List[int], provider_ids: List[int], start_date: str, days: int) -> List[dict]:
+    """
+    Fetch available appointment slots.
+    The LLM is responsible for calculating start_date and days.
+    For example, if the user asks for "tomorrow", the LLM should calculate tomorrow's date.
+    """
     client = NexHealthClient()
     return client.get_available_slots(start_date, days, location_ids, provider_ids)
 
+@tool
+def view_appointment(appointment_id: int, location_id: int) -> Union[str, dict]:
+    """Retrieve details for a specific upcoming appointment by its ID."""
+    client = NexHealthClient()
+    return client.view_appointment(appointment_id, location_id)
 
 @tool
-def verify_appointment_data(
-    name: Optional[str] = None,
-    phone_number: Optional[str] = None,
-    dob: Optional[str] = None,
-    location: Optional[int] = None,
-    provider: Optional[int] = None,
-    operatory_id: Optional[int] = None,
-    slot_time: Optional[str] = None,
-) -> dict:
-    """Check if all required fields are present."""
-    input_data = {
-        "name": name, "phone_number": phone_number, "dob": dob,
-        "location": location, "provider": provider,
-        "operatory_id": operatory_id, "slot_time": slot_time
-    }
-    required = ["name", "phone_number", "dob", "location", "provider", "operatory_id", "slot_time"]
-    missing = [f for f in required if input_data.get(f) is None]
-    return {"is_valid": not missing, "missing_fields": missing}
-
-
-@tool
-def confirmation_node(
-    name: str,
+def create_patient(
+    provider_id: int,
+    first_name: str,
+    last_name: str,
+    email: str,
     phone_number: str,
-    dob: str,
-    location: int,
-    provider: int,
-    slot_time: str,
-    **kwargs
-) -> str:
-    """Generate confirmation message."""
-    return (
-        f"Please confirm:\n"
-        f"Name: {name}\n"
-        f"Phone: {phone_number}\n"
-        f"DOB: {dob}\n"
-        f"Location ID: {location}\n"
-        f"Provider ID: {provider}\n"
-        f"Slot: {slot_time}\n\n"
-        f"Reply 'confirm' or 'cancel'"
+    date_of_birth: str,
+    location_id: int
+) -> Dict[str, Any]:
+    """Create a new patient record. Call this *before* booking for new patients."""
+    client = NexHealthClient()
+    return client.create_patient(
+        provider_id=provider_id,
+        first_name=first_name,
+        last_name=last_name,
+        email=email,
+        phone_number=phone_number,
+        date_of_birth=date_of_birth,
+        location_id=location_id
     )
-
 
 @tool
 def make_appointment(
@@ -114,7 +114,7 @@ def make_appointment(
     start_time: str,
     appointment_type_id: int
 ) -> dict:
-    """Create a new appointment."""
+    """Book the final appointment. Call this *only* after user confirmation."""
     client = NexHealthClient()
     return client.make_appointment(
         patient_id,
@@ -127,375 +127,325 @@ def make_appointment(
 
 
 @tool
-def view_appointment(
-    appointment_id: Optional[int] = None,
-    location_id: Optional[int] = None,
-    days: int = 10
-) -> Union[str, dict, List[dict]]:
-    """Retrieve appointment by ID or list upcoming ones."""
-    client = NexHealthClient()
-    return client.view_appointment(appointment_id, location_id, days)
-
+def update_personal_info(
+    name: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    phone_number: Optional[str] = None,
+    dob: Optional[str] = None,
+    email: Optional[str] = None
+) -> dict:
+    """
+    Updates personal information in the state.
+    Use this when the user provides info (e.g., "My name is John Doe").
+    If a full name is given, split it into first_name and last_name.
+    """
+    updates = {}
+    if name:
+        updates["name"] = name
+        if " " in name and not first_name and not last_name:
+            parts = name.split(" ", 1)
+            updates["first_name"] = parts[0]
+            updates["last_name"] = parts[1] if len(parts) > 1 else ""
+    if first_name: updates["first_name"] = first_name
+    if last_name: updates["last_name"] = last_name
+    if phone_number: updates["phone_number"] = phone_number
+    if dob: updates["dob"] = dob
+    if email: updates["email"] = email
+    
+    return {"status": "info updated", "updated_fields": list(updates.keys())}
 
 @tool
-def select_slot(slot_time: str, operatory_id: int) -> dict:
-    """Call this tool when the user has definitively chosen a specific slot_time and operatory_id."""
-    return {"slot_time": slot_time, "operatory_id": operatory_id}
+def select_location(location_id: int, location_name: str) -> dict:
+    """Selects a location from the options and updates the state."""
+    return {"location": location_id, "location_name": location_name}
 
+@tool
+def select_provider(provider_id: int, provider_name: str) -> dict:
+    """Selects a provider from the options and updates the state."""
+    return {"provider": provider_id, "provider_name": provider_name}
+
+@tool
+def select_slot(start_time: str, operatory_id: int) -> dict:
+    """Selects an appointment slot from the options and updates the state."""
+    return {"slot_time": start_time, "operatory_id": operatory_id}
 
 @tool
 def user_confirms(confirmed: bool, message: Optional[str] = None) -> dict:
-    """
-    Call this tool to register the user's final decision.
-    Set 'confirmed' to True if they agreed.
-    Set 'confirmed' to False if they canceled.
-    'message' is for any final words, like 'Booking canceled.'
-    """
+    """Registers the user's final decision (confirm or cancel) before booking."""
     return {"confirmed": confirmed, "message": message}
 
 
-def patient_info_node(state: AppointmentState) -> AppointmentState:
-    llm_with_tools = llm.bind_tools([info_getter, search_patient, view_appointment])
-    messages = state.messages
 
+
+def inject_system_prompt(state: AppointmentState):
+    """Injects the main system prompt and current date."""
+    messages = state.messages
+ 
     if not messages or messages[0]["role"] != "system":
+        today = datetime.now().strftime('%Y-%m-%d')
         system_prompt = (
-            "You are a helpful assistant for booking appointments. "
-            "Your first task is to get the user's full name, phone number, and date of birth (YYYY-MM-DD). "
-            "Be conversational. If they only provide some information, acknowledge it and ask for what's missing. "
-            "Once you have all three pieces of information, you *must* call the `info_getter` tool."
+            f"You are a helpful assistant for booking dental appointments. Today's date is {today}.\n"
+            "1. Your first task is to collect the user's full name, phone number, and date of birth (YYYY-MM-DD). Use the `update_personal_info` tool to store this.\n"
+            "2. Once you have name, phone, and DOB, **silently** (do not mention it) call `search_patient`.\n"
+            "3. Based on the `search_patient` result, you'll know if they are an existing patient or a new patient. Continue the conversation accordingly.\n"
+            "4. **Existing Patient Flow:** Welcome them back. Ask to book an appointment. Use `get_locations`, `get_providers`, and `get_slots` to find a time. Use `select_location`, `select_provider`, and `select_slot` to confirm their choices.\n"
+            "5. **New Patient Flow:** Inform them they need to register. Ask for their email and use `update_personal_info`. Then, follow the same booking flow as an existing patient (get location, provider, slot). After they select a provider, call `create_patient` to register them *before* finding slots.\n"
+            "6. **Slot Finding:** When the user asks for slots (e.g., 'tomorrow', 'next week', 'today after 3 pm'), use today's date ({today}) to calculate the correct `start_date` and `days` for the `get_slots` tool.\n"
+            "7. **Confirmation:** Once a slot is selected and all info is present, clearly list *all* appointment details (Name, DOB, Phone, Email, Location, Provider, Time) and ask for final confirmation. Use the `user_confirms` tool.\n"
+            "8. **Booking:** Only after `user_confirms(confirmed=True)` is called, you must call `make_appointment` to book it.\n"
+            "Be conversational and helpful. Only ask for one piece of information at a time."
         )
         messages.insert(0, {"role": "system", "content": system_prompt})
+    return messages
 
+def call_llm_and_update_state(state: AppointmentState, tool_set: list) -> AppointmentState:
+    """A generic function to call the LLM, execute tools, and update state."""
+    
+    
+    messages = inject_system_prompt(state)
+    
+    llm_with_tools = llm.bind_tools(tool_set)
     response = llm_with_tools.invoke(messages)
-    tool_calls = getattr(response, "tool_calls", [])
+    messages.append({"role": "assistant", "content": response.content})
 
-    if tool_calls and tool_calls[0]["name"] == "info_getter":
-        args = tool_calls[0]["args"]
-        state = state.model_copy(update=args)
+    if tool_calls := getattr(response, "tool_calls", []):
+        new_state = state.model_copy()
+        for call in tool_calls:
+            tool_name = call["name"]
+            tool_args = call["args"]
+           
+            tool_map = {t.name: t for t in tool_set}
+            if tool_name not in tool_map:
+                messages.append({"role": "tool", "content": f"Error: Tool '{tool_name}' not found."})
+                continue
 
-        search_result = search_patient.invoke({
-            "name": state.name,
-            "phone_number": state.phone_number,
-            "dob": state.dob,
-            "location_id": 331668
-        })
+            tool_func = tool_map[tool_name]
+            try:
+                result = tool_func.invoke(tool_args)
+              
+                if tool_name == "update_personal_info":
+                    new_state = new_state.model_copy(update=result)
+                elif tool_name == "search_patient":
+                    if isinstance(result, list) and any(p.get("status") == "verified patient" for p in result):
+                        p = result[0]
+                        upcoming = p.get("upcoming_appts", [])
+                        updates = {
+                            "patient_id": str(p["id"]),
+                            "is_existing_patient": True,
+                            "location": p["location_ids"][0] if p.get("location_ids") else None,
+                            "upcoming_appt_id": upcoming[0]["id"] if upcoming else None,
+                            "provider": p.get("provider_id"),
+                            "email": p.get("email")
+                        }
+                        new_state = new_state.model_copy(update=updates)
+                    else:
+                        new_state = new_state.model_copy(update={"is_existing_patient": False})
+                elif tool_name in ["select_location", "select_provider", "select_slot"]:
+                    new_state = new_state.model_copy(update=result)
+                elif tool_name == "create_patient":
+                    new_state = new_state.model_copy(update={"patient_id": str(result["id"])})
+                elif tool_name in ["get_locations", "get_providers", "get_slots"]:
+                    options_key = f"{tool_name.split('_')[1]}_options" 
+                    new_state = new_state.model_copy(update={options_key: result})
+                
+                messages.append({"role": "tool", "tool_call_id": call['id'], "content": str(result)})
 
-        if isinstance(search_result, list) and any(p.get("status") == "verified patient" for p in search_result):
-            p = search_result[0]
-            upcoming = p.get("upcoming_appts", [])
-            upcoming_id = upcoming[0]["id"] if upcoming else None
-            prov_id = p.get("provider_id")
-
-            print(p["location_ids"][0])
-
-            state = state.model_copy(update={
-                "patient_id": str(p["id"]),
-                "is_existing_patient": True,
-                "location": p["location_ids"][0],
-                "upcoming_appt_id": upcoming_id,
-                "provider": prov_id
-            })
-            msg = "Welcome back!"
-            if upcoming_id:
-                msg += f" You have an upcoming appointment (ID: {upcoming_id})."
-            msg += " Let's book your next one."
-        else:
-            state = state.model_copy(update={"is_existing_patient": False})
-            msg = "No record found. Let's register you as a new patient."
-
-        messages.append({"role": "assistant", "content": msg})
-        return state.model_copy(update={"messages": messages})
-
-    if response.content:
-        messages.append({"role": "assistant", "content": response.content})
-        return state.model_copy(update={"messages": messages})
-
-    messages.append({"role": "assistant", "content": "I'm sorry, I didn't catch that. Please provide your full name, phone, and date of birth."})
-    return state.model_copy(update={"messages": messages})
-
-
-def existing_patient_node(state: AppointmentState) -> AppointmentState:
-    llm_with_tools = llm.bind_tools([get_providers, get_slots, select_slot])
-    messages = state.messages
-    
-    system_prompt = (
-        "Your task is now to book an appointment for this existing patient. "
-        f"Their preferred location is {state.location}. "
-    )
-    
-    if state.provider and not any("Here are the available providers" in m["content"] for m in messages):
-        system_prompt += (
-            f"Their preferred provider is {state.provider}. First, ask them if they want to use this provider. "
-            "If they say yes, call `get_slots`. "
-            "If they say no or want to see other options, call `get_providers`."
-        )
-    else:
-        system_prompt += "The user wants to choose a provider. If you don't have a list, call `get_providers`. "
-        system_prompt += "If they choose a provider ID, call `get_slots`. "
-    
-    system_prompt += "\nOnce they select a specific slot_time and operatory_id from the list, call `select_slot`."
-    
-    messages.append({"role": "system", "content": system_prompt})
-
-    response = llm_with_tools.invoke(messages)
-    messages.pop() 
-    tool_calls = getattr(response, "tool_calls", [])
-
-    if tool_calls:
-        tool_call = tool_calls[0]
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+            except Exception as e:
+                logging.error(f"Error calling tool {tool_name}: {e}")
+                messages.append({"role": "tool", "tool_call_id": call['id'], "content": f"Error: {e}"})
         
-        if tool_name == "get_providers":
-            providers = get_providers.invoke(tool_args)
-            prov_list = "\n".join([f"{p['id']}: {p['name']}" for p in providers])
-            msg = f"Here are the available providers at your location:\n{prov_list}\nPlease select an ID."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages, "provider": None})
+        
+        return new_state.model_copy(update={"messages": messages})
 
-        elif tool_name == "get_slots":
-            if "provider_ids" not in tool_args or not tool_args["provider_ids"]:
-                tool_args["provider_ids"] = [state.provider]
-            tool_args["location_ids"] = [state.location]
-            if "start_date" not in tool_args:
-                tool_args["start_date"] = datetime.now().strftime("%Y-%m-%d")
-            if "days" not in tool_args:
-                tool_args["days"] = 7
-                
-            slots = get_slots.invoke(tool_args)
-            if not slots:
-                messages.append({"role": "assistant", "content": "I'm sorry, no slots are available for that provider in the next 7 days. Would you like to change providers?"})
-                return state.model_copy(update={"messages": messages, "provider": None}) 
-                
-            slot_list = "\n".join([f"Time: {s['start_time']} (Operatory ID: {s['operatory_id']})" for s in slots])
-            msg = f"Here are the available slots:\n{slot_list}\nPlease select a time and its operatory ID."
-            messages.append({"role": "assistant", "content": msg})
-            state = state.model_copy(update={"provider": tool_args["provider_ids"][0]})
-
-        elif tool_name == "select_slot":
-            selected = tool_call["args"]
-            messages.append({"role": "assistant", "content": f"Great, I've selected {selected['slot_time']}."})
-            return state.model_copy(update={
-                "slot_time": selected["slot_time"],
-                "operatory_id": selected["operatory_id"],
-                "messages": messages
-            })
-
-    else:
-        messages.append({"role": "assistant", "content": response.content})
-
+  
     return state.model_copy(update={"messages": messages})
 
+
+def patient_info_node(state: AppointmentState) -> AppointmentState:
+    """
+    Collects basic patient info (name, phone, DOB) and determines if they
+    are an existing or new patient by calling search_patient.
+    """
+    tools = [update_personal_info, search_patient, view_appointment]
+    return call_llm_and_update_state(state, tools)
 
 def new_patient_node(state: AppointmentState) -> AppointmentState:
-    llm_with_tools = llm.bind_tools([get_locations, get_providers, get_slots, select_slot])
-    messages = state.messages
+    """
+    Handles the flow for new patients:
+    1. Collects email.
+    2. Collects location and provider preference.
+    3. Calls create_patient.
+    4. Finds available slots.
+    """
+    tools = [
+        update_personal_info,
+        get_locations,
+        get_providers,
+        get_slots,
+        select_location,
+        select_provider,
+        select_slot,
+        create_patient
+    ]
+    return call_llm_and_update_state(state, tools)
 
-    system_prompt = (
-        "Your task is to register a new patient. "
-        "First, you *must* call `get_locations` to show them the options. "
-        "Once they choose a location ID, you *must* call `get_providers` for that location. "
-        "Once they choose a provider ID, you *must* call `get_slots`. "
-        "Once they select a specific slot_time and operatory_id, call `select_slot`."
-    )
-    messages.append({"role": "system", "content": system_prompt})
-        
-    response = llm_with_tools.invoke(messages)
-    messages.pop()
-    tool_calls = getattr(response, "tool_calls", [])
-
-    if tool_calls:
-        tool_call = tool_calls[0]
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-
-        if tool_name == "get_locations":
-            locs = get_locations.invoke(tool_args)
-            loc_list = "\n".join([f"{l['id']}: {l['name']}, {l['city']}" for l in locs])
-            msg = f"Here are our locations:\n{loc_list}\nPlease select an ID."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages})
-
-        elif tool_name == "get_providers":
-            if "location_id" not in tool_args:
-                messages.append({"role": "assistant", "content": "I'm sorry, I didn't catch which location you wanted. Please select a location ID from the list."})
-                return state.model_copy(update={"messages": messages})
-                
-            provs = get_providers.invoke(tool_args)
-            prov_list = "\n".join([f"{p['id']}: {p['name']}" for p in provs])
-            msg = f"Great. Here are the providers at that location:\n{prov_list}\nPlease select an ID."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages, "location": tool_args["location_id"]})
-
-        elif tool_name == "get_slots":
-            if "provider_ids" not in tool_args or not state.location:
-                messages.append({"role": "assistant", "content": "I'm sorry, I'm missing a provider. Please select a provider ID."})
-                return state.model_copy(update={"messages": messages})
-            
-            tool_args["location_ids"] = [state.location]
-            if "start_date" not in tool_args:
-                tool_args["start_date"] = datetime.now().strftime("%Y-%m-%d")
-            if "days" not in tool_args:
-                tool_args["days"] = 7
-
-            slots = get_slots.invoke(tool_args)
-            if not slots:
-                messages.append({"role": "assistant", "content": "I'm sorry, no slots are available for that provider in the next 7 days. Would you like to change providers?"})
-                return state.model_copy(update={"messages": messages, "provider": None})
-
-            slot_list = "\n".join([f"Time: {s['start_time']} (Operatory ID: {s['operatory_id']})" for s in slots])
-            msg = f"Here are the available slots:\n{slot_list}\nPlease select a time and its operatory ID."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages, "provider": tool_args["provider_ids"][0]})
-
-        elif tool_name == "select_slot":
-            selected = tool_call["args"]
-            messages.append({"role": "assistant", "content": f"Great, I've selected {selected['slot_time']}."})
-            return state.model_copy(update={
-                "slot_time": selected["slot_time"],
-                "operatory_id": selected["operatory_id"],
-                "messages": messages
-            })
-            
-    else:
-        messages.append({"role": "assistant", "content": response.content})
-
-    return state.model_copy(update={"messages": messages})
-
+def existing_patient_node(state: AppointmentState) -> AppointmentState:
+    """
+    Handles the flow for existing patients:
+    1. Confirms/gets location and provider preference.
+    2. Finds available slots.
+    """
+    tools = [
+        get_locations,
+        get_providers,
+        get_slots,
+        select_location,
+        select_provider,
+        select_slot,
+        update_personal_info  
+    ]
+    return call_llm_and_update_state(state, tools)
 
 def schedule_appointment_node(state: AppointmentState) -> AppointmentState:
-    llm_with_tools = llm.bind_tools([verify_appointment_data, confirmation_node, user_confirms])
-    messages = state.messages
+    """
+    Confirms all details with the user and books the appointment.
+    """
+    tools = [
+        user_confirms,
+        make_appointment,
+        update_personal_info, 
+        select_location,      
+        select_provider,
+    ]
 
-    if not any("Please confirm" in m["content"] for m in messages):
-        ver_input = {
-            "name": state.name, "phone_number": state.phone_number, "dob": state.dob,
-            "location": state.location, "provider": state.provider,
-            "operatory_id": state.operatory_id, "slot_time": state.slot_time
-        }
-        ver = verify_appointment_data.invoke(ver_input)
-
-        if not ver["is_valid"]:
-            msg = f"I'm almost ready, but I'm still missing: {', '.join(ver['missing_fields'])}. Can you provide that?"
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages})
-
-        conf_msg = confirmation_node.invoke(ver_input)
-        messages.append({"role": "assistant", "content": conf_msg})
-        return state.model_copy(update={"messages": messages})
-
-    messages.append({"role": "system", "content": "The user is now replying to the confirmation message. Use the `user_confirms` tool to capture their 'yes' or 'no' response."})
-    response = llm_with_tools.invoke(messages)
-    messages.pop()
-    tool_calls = getattr(response, "tool_calls", [])
-
-    if tool_calls and tool_calls[0]["name"] == "user_confirms":
-        decision = tool_calls[0]["args"]
+    last_message = state.messages[-1]
+    if last_message["role"] == "tool" and "confirmed" in last_message["content"]:
         
-        if decision["confirmed"]:
-            try:
-                appt = make_appointment.invoke({
-                    "patient_id": state.patient_id or "new_patient",
-                    "location_id": state.location,
-                    "provider_id": state.provider,
-                    "operatory_id": state.operatory_id,
-                    "start_time": state.slot_time,
-                    "appointment_type_id": 1
-                })
-                msg = f"All set! Your appointment is booked. The ID is: {appt.get('appointment_id', 'N/A')}"
-                messages.append({"role": "assistant", "content": msg})
-            except Exception as e:
-                logging.error(f"Appointment booking failed: {e}")
-                messages.append({"role": "assistant", "content": f"I'm sorry, something went wrong while booking. Error: {e}"})
-            
-            return state.model_copy(update={"messages": messages})
+        import ast
+        try:
+            confirm_result = ast.literal_eval(last_message["content"])
+            if confirm_result.get("confirmed"):
+           
+                try:
+                    appt = make_appointment.invoke({
+                        "patient_id": state.patient_id,
+                        "location_id": state.location,
+                        "provider_id": state.provider,
+                        "operatory_id": state.operatory_id,
+                        "start_time": state.slot_time,
+                        "appointment_type_id": state.appointment_type_id
+                    })
         
-        else:
-            msg = decision.get("message", "Booking canceled.")
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={"messages": messages})
+                    msg = (
+                        f"Your appointment is booked!\n"
+                        f"Appointment ID: {appt.get('appointment_id')}\n"
+                        f"Time: {appt.get('start_time')}\n"
+                        "Thank you for booking. Goodbye!"
+                    )
+                    messages = state.messages + [{"role": "assistant", "content": msg}]
+                    return state.model_copy(update={"messages": messages})
+                except Exception as e:
+                    logging.error(f"Appointment booking failed: {e}")
+                    msg = f"Error booking appointment: {e}. Please try again or update your details."
+                    messages = state.messages + [{"role": "assistant", "content": msg}]
+                    return state.model_copy(update={"messages": messages})
+        except Exception as e:
+            logging.error(f"Error parsing confirm_result: {e}")
 
-    if not tool_calls and response.content:
-        messages.append({"role": "assistant", "content": response.content})
-    
-    return state.model_copy(update={"messages": messages})
+    return call_llm_and_update_state(state, tools)
+
 
 
 workflow = StateGraph(AppointmentState)
+
+
 workflow.add_node("patient_info", patient_info_node)
-workflow.add_node("existing_patient", existing_patient_node)
 workflow.add_node("new_patient", new_patient_node)
+workflow.add_node("existing_patient", existing_patient_node)
 workflow.add_node("schedule_appointment", schedule_appointment_node)
+
 
 workflow.set_entry_point("patient_info")
 
-def decide_patient_path(s: AppointmentState):
-    """Decide where to go after patient_info node."""
+
+
+def decide_patient_path(s: AppointmentState) -> str:
+    """Routes from patient_info to the correct flow based on search results."""
     if s.is_existing_patient is True:
         return "existing_patient"
     if s.is_existing_patient is False:
         return "new_patient"
-    return END
+   
+    return "patient_info"
 
-workflow.add_conditional_edges("patient_info", decide_patient_path)
-
-def route_to_schedule(s: AppointmentState):
-    """If slot is picked, go to schedule. Otherwise, stay in patient node."""
-    if s.slot_time:
-        return "schedule_appointment"
+def route_to_schedule(s: AppointmentState) -> str:
+    """
+    Checks if all required info for booking is present.
+    For new patients, we also need a patient_id.
+    """
+    if s.slot_time and s.operatory_id and s.provider and s.location:
+        if s.is_existing_patient:
+            return "schedule_appointment"
+        if not s.is_existing_patient and s.patient_id:
+          
+            return "schedule_appointment"
     
-    if s.is_existing_patient:
-        return "existing_patient"
-    return "new_patient"
 
-workflow.add_conditional_edges("existing_patient", route_to_schedule)
-workflow.add_conditional_edges("new_patient", route_to_schedule)
+    return "new_patient" if not s.is_existing_patient else "existing_patient"
 
-
-def decide_schedule_path(s: AppointmentState):
-    """Decide if booking is done or needs more info."""
-    last_msg = s.messages[-1]["content"].lower()
-    if "booked" in last_msg or "canceled" in last_msg:
+def decide_after_schedule(s: AppointmentState) -> str:
+    """Decides what to do after the scheduling attempt."""
+    last_msg = s.messages[-1]["content"]
+    if "Your appointment is booked!" in last_msg:
+        return END
+    if "Booking canceled" in last_msg: 
         return END
     
-    if "missing" in last_msg:
-        return "patient_info"
-        
     return "schedule_appointment"
 
-workflow.add_conditional_edges("schedule_appointment", decide_schedule_path)
+
+workflow.add_conditional_edges("patient_info", decide_patient_path)
+workflow.add_conditional_edges("new_patient", route_to_schedule)
+workflow.add_conditional_edges("existing_patient", route_to_schedule)
+workflow.add_conditional_edges("schedule_appointment", decide_after_schedule)
+
 
 app = workflow.compile()
 
-
 def run_interactive_workflow():
-    state = {} 
+    state = AppointmentState(messages=[])
     print("Welcome to the Appointment Booking System! Type 'exit' to quit.")
-    
+
     while True:
         user = input("You: ")
         if user.lower() == "exit":
             print("Goodbye!")
             break
 
-        current_messages = state.get("messages", []) + [{"role": "user", "content": user}]
-        state = {**state, "messages": current_messages}
+      
+        state.messages.append({"role": "user", "content": user})
 
         try:
-            state = app.invoke(state) 
+          
+            state = app.invoke(state)
             
-            assistant = state.get("messages", [])[-1]["content"]
-            print(f"Assistant: {assistant}")
+         
+            assistant_msg = state.messages[-1]
+            if assistant_msg["role"] == "assistant" and assistant_msg["content"]:
+                print(f"Assistant: {assistant_msg['content']}")
             
-            if "booked" in assistant.lower() or "canceled" in assistant.lower():
-                print("Session ended. Start a new one.")
-                state = {}
+ 
+            if "Goodbye!" in assistant_msg["content"]:
+                print("Session ended.")
+                state = AppointmentState(messages=[]) 
+                print("\n--- New Session ---")
+                
         except Exception as e:
             print(f"Error: {e}")
-            state = {}
-            print("Please start over with name, phone, and DOB.")
-
+            logging.error(f"Workflow error: {e}")
+            state = AppointmentState(messages=[]) 
+            print("An error occurred. Please start over.")
 
 if __name__ == "__main__":
     run_interactive_workflow()
