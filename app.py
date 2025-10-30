@@ -5,21 +5,13 @@ from langgraph.graph import StateGraph, END
 from langchain_core.tools import tool
 from datetime import datetime, timedelta
 from nexhealth_client import NexHealthClient
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 import logging
 import time  
-from langchain_openai import ChatOpenAI
-from langsmith import traceable
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
-
-
-
-
 
 llm = ChatOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -30,7 +22,6 @@ llm = ChatOpenAI(
         # "X-Title": os.getenv("YOUR_SITE_NAME"),
     }
 )
-
 
 class AppointmentState(BaseModel):
     messages: List[Dict[str, Any]] = Field(default_factory=list)
@@ -56,10 +47,15 @@ class AppointmentState(BaseModel):
     provider_options: Optional[List[Dict]] = Field(default_factory=list)
     slot_options: Optional[List[Dict]] = Field(default_factory=list)
 
+    # New fields for improvements
+    preferred_provider: Optional[int] = None
+    preferred_provider_name: Optional[str] = None
+    awaiting_confirm: Optional[bool] = None
+
 
 @tool
 def info_getter(name: str, phone_number: str, dob: str) -> dict:
-    """Extract name, phone_number, and dob from user input."""
+    """Extract name, phone_number, and dob from the conversation."""
     return {"name": name, "phone_number": phone_number, "dob": dob}
 
 
@@ -156,7 +152,7 @@ def make_appointment(
 ) -> dict:
     """Create a new appointment."""
     client = NexHealthClient()
-    return client.make_appointment(
+    appointment_created=client.make_appointment(
         patient_id,
         location_id,
         provider_id,
@@ -164,6 +160,11 @@ def make_appointment(
         start_time,
         appointment_type_id
     )
+    error=appointment_created.get("error")
+    if error is not None:
+        return {"error": error}
+
+    return appointment_created
 
 
 @tool
@@ -243,10 +244,22 @@ def create_patient(
         date_of_birth=date_of_birth,
         location_id=location_id
     )
+
+    error=patient_data.get("error")
+    if error is not None:
+        return {"error": error}
     
     patient_data["patient_id"] = patient_data.get("id")
     return patient_data
-    
+
+
+@tool
+def select_location(selection: str) -> dict:
+    """
+    Call this tool when the user has definitively chosen a specific location from the list.
+    'selection' can be the number (e.g., '1', '2') or a string matching the name.
+    """
+    return {"selection": selection}
 
 
 
@@ -272,10 +285,11 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
     messages = state.messages
     if not messages or messages[0]["role"] != "system":
         system_prompt = (
-            "You are a helpful assistant for booking appointments at my Health Clinic. If caller ask for a "
+            "You are a helpful assistant for booking appointments at my Health Clinic. "
             "Your first task is to get the user's full name, phone number, and date of birth (YYYY-MM-DD). "
             "Be conversational. If they only provide some information, acknowledge it and ask for what's missing. "
-            "Once you have all three pieces of information, you *must* call the `info_getter` tool."
+            "You can accumulate information across messages. "
+            "Once you have all three pieces of information from the conversation, you *must* call the `info_getter` tool with the extracted values."
         )
         messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -301,7 +315,6 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
             loc_id = p["location_ids"][0]
             prov_id = p.get("provider_id")
             
-       
             loc_name = f"ID: {loc_id}"
             prov_name = f"ID: {prov_id}" if prov_id else "any provider"
             try:
@@ -325,18 +338,20 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
                 "location": loc_id,
                 "location_name": loc_name,
                 "upcoming_appt_id": upcoming_id,
-                "provider": prov_id,
-                "provider_name": prov_name
+                "preferred_provider": prov_id,
+                "preferred_provider_name": prov_name,
+                "awaiting_confirm": True
             })
             
             msg = f"Welcome back, {state.name}! Your preferred location is {loc_name}."
             if upcoming_id:
                 msg += f" I see you have an upcoming appointment (ID: {upcoming_id})."
             
+            msg += " Let's book your next appointment."
             if prov_id:
-                 msg += f" Your preferred provider is {prov_name}. Would you like to book with them again?"
+                msg += f" Your preferred provider is {prov_name}. Would you like to book at this location with this provider?"
             else:
-                msg += " Let's book your next appointment. We'll need to select a provider."
+                msg += " Would you like to book at this location? We'll need to select a provider."
         
         else:
             state = state.model_copy(update={"is_existing_patient": False})
@@ -420,6 +435,24 @@ def _find_selected_provider(selection: str, provider_options: List[Dict]) -> Opt
     return None
 
 
+def _find_selected_location(selection: str, location_options: List[Dict]) -> Optional[Dict]:
+    """Helper to find a location from options based on user's selection (number or text)."""
+    if not location_options:
+        return None
+        
+    if selection.isdigit():
+        idx = int(selection) - 1
+        if 0 <= idx < len(location_options):
+            return location_options[idx]
+            
+    selection_lower = selection.lower()
+    for l in location_options:
+        if selection_lower in l['name'].lower():
+            return l
+            
+    logging.warning(f"Could not match selection '{selection}' to any location.")
+    return None
+
 
 def existing_patient_node(state: AppointmentState) -> AppointmentState:
     if state.slot_time:  
@@ -427,8 +460,21 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
 
     messages = state.messages
     system_prompts = []
+    tools = []
     
-    
+    if state.awaiting_confirm:
+        system_prompts.append(
+            "The user is responding to the confirmation of location and provider. "
+            "If they confirm everything, ask for a start date to search for slots. "
+            f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+            "Convert their answer (e.g.,'today', 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
+            "Then, call `get_slots` with `start_date`, `days`, `location_ids`=[{state.location}], `provider_ids`=[{state.preferred_provider}]. "
+            "If they want a different provider, call `get_providers(location_id={state.location})`. "
+            "If they want a different location, call `get_locations()`. "
+        )
+        tools = [get_slots, get_providers, get_locations]
     
     if state.provider_options and not state.provider:
 
@@ -437,7 +483,7 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
             "The user was shown a list of providers. They will now select one by name or number. "
             f"You must map their selection to the correct provider ID from this list:\n{prov_list_str}\n"
             f"Once you have the provider ID, ask them for a start date to search for slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
+            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. "
             "Then, you *must* call `get_slots` with that `start_date`, `days=7`, and the `provider_ids` list."
         )
         tools = [get_slots]
@@ -448,20 +494,41 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
         system_prompts.append(
             "The user was shown a list of slots. They will now select one by number or time. "
             f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
+            "If the user asks for the first one, earliest, or just one slot, use '1'."
             "You *must* call `select_slot(selection=...)` with their choice."
         )
         tools = [select_slot]
         
+    elif state.location_options and not state.location:
+        loc_list_str = "\n".join([f"Number {i+1} ('{l['name']}') is ID {l['id']}" for i, l in enumerate(state.location_options)])
+        system_prompts.append(
+            "The user was shown a list of locations. They will now select one by name or number. "
+            f"You must capture their selection as a string (e.g., '1' or 'Location Name'). Here is the list for your reference:\n{loc_list_str}\n"
+            "You *must* call `select_location(selection=...)` with their choice."
+        )
+        tools = [select_location]
+
+    elif state.provider_options and not state.provider:
+        prov_list_str = "\n".join([f"Number {i+1} ('{p['name']}') is ID {p['id']}" for i, p in enumerate(state.provider_options)])
+        system_prompts.append(
+            "The user was shown a list of providers. They will now select one by name or number. "
+            f"You must capture their selection as a string (e.g., '1' or 'Dr. Smith'). Here is the list for your reference:\n{prov_list_str}\n"
+            "You *must* call `select_provider(selection=...)` with their choice."
+        )
+        tools = [select_provider]
+
     elif not state.provider:
      
         system_prompts.append(
             "The patient needs to select a provider. "
-            f"Their preferred provider is {state.provider_name} (ID: {state.provider}). "
+            f"Their preferred provider is {state.preferred_provider_name} (ID: {state.preferred_provider}). "
             "First, ask them if they want to use this provider. "
             "If they say yes, ask them for a start date to search for slots. "
             f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days=7`, and `provider_ids`=[{state.provider}]. "
+            "You MUST convert their answer (e.g.,'today', 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
+            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
+            "Then, you *must* call `get_slots` with that `start_date`, `days`, and `provider_ids`=[{state.preferred_provider}]. "
             "If they say no or want other options, call `get_providers`."
         )
         tools = [get_providers, get_slots]
@@ -471,9 +538,11 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
         system_prompts.append(
             "The user has confirmed their provider. Ask them for a start date to search for slots. "
             f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+            "You MUST convert their answer (e.g.,'today',  'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
             "Do NOT ask for the number of days. "
-            f"Then, you *must* call `get_slots` with that `start_date`, `days=7`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
+            f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
         )
         tools = [get_slots]
 
@@ -494,32 +563,77 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
         
+        if tool_name == "get_locations":
+            locations = get_locations.invoke(tool_args)
+            loc_list = "\n".join([f"{i+1}. {l['name']}" for i, l in enumerate(locations)])
+            msg = f"Here are the available locations:\n{loc_list}\nPlease select one by number or name."
+            messages.append({"role": "assistant", "content": msg})
+            return state.model_copy(update={"messages": messages, "location_options": locations, "location": None, "provider_options": [], "provider": None, "awaiting_confirm": False})
+
+        elif tool_name == "select_location":
+            selection = tool_args["selection"]
+            selected_loc = _find_selected_location(selection, state.location_options)
+            if not selected_loc:
+                loc_list = "\n".join([f"{i+1}. {l['name']}" for i, l in enumerate(state.location_options)])
+                msg = f"Sorry, I didn't understand that selection. Please pick from the list:\n{loc_list}"
+                messages.append({"role": "assistant", "content": msg})
+                return state.model_copy(update={"messages": messages})
+            msg = f"Great, you've selected {selected_loc['name']}."
+            messages.append({"role": "assistant", "content": msg})
+            return state.model_copy(update={
+                "location": selected_loc["id"],
+                "location_name": selected_loc["name"],
+                "messages": messages,
+                "location_options": [] 
+            })
+
         if tool_name == "get_providers":
             providers = get_providers.invoke(tool_args)
             prov_list = "\n".join([f"{i+1}. {p['name']}" for i, p in enumerate(providers)])
             msg = f"Here are the other available providers at {state.location_name}:\n{prov_list}\nPlease select one by number or name."
             messages.append({"role": "assistant", "content": msg})
+            state.awaiting_confirm = False
             return state.model_copy(update={"messages": messages, "provider": None, "provider_name": None, "provider_options": providers})
 
         elif tool_name == "get_slots":
+            state.awaiting_confirm = False
+            min_time = tool_args.pop("min_time", None)
+            max_time = tool_args.pop("max_time", None)
            
-            prov_id = tool_args.get("provider_ids", [state.provider])[0]
-            prov_name = state.provider_name
+            prov_id = tool_args.get("provider_ids", [state.provider or state.preferred_provider])[0]
+            prov_name = state.provider_name or state.preferred_provider_name
             if state.provider_options:
                 found_prov = next((p for p in state.provider_options if p['id'] == prov_id), None)
                 if found_prov:
                     prov_name = found_prov['name']
             
             tool_args["location_ids"] = [state.location]
+            tool_args.setdefault("days", 7)
             
             slots = get_slots.invoke(tool_args)
+            if min_time or max_time:
+                def get_time(s):
+                    return datetime.fromisoformat(s['start_time']).time()
+                if min_time:
+                    min_t = datetime.strptime(min_time, '%H:%M').time()
+                    slots = [s for s in slots if get_time(s) >= min_t]
+                if max_time:
+                    max_t = datetime.strptime(max_time, '%H:%M').time()
+                    slots = [s for s in slots if get_time(s) <= max_t]
+            
             if not slots:
-                msg = f"I'm sorry, no slots are available for {prov_name} in the next 7 days. Would you like to change providers?"
+                msg = f"I'm sorry, no slots are available for {prov_name} in the specified period. Would you like to change providers or dates?"
                 messages.append({"role": "assistant", "content": msg})
-                return state.model_copy(update={"messages": messages, "provider": None, "provider_name": None, "provider_options": []}) 
+                return state.model_copy(update={"messages": messages, "provider": None if "provider" in msg else state.provider, "provider_name": None, "provider_options": []}) 
                 
-            slot_list = _format_slots_for_user(slots)
-            msg = f"Here are the available slots for {prov_name}:\n{slot_list}\nPlease select a slot by its number."
+            is_next_available = any(phrase in state.messages[-1]["content"].lower() for phrase in ["next available", "earliest slot", "soonest slot", "first available", "earliest available", "show one slot", "one slot", "the first one"])
+            if is_next_available and slots:
+                slots = sorted(slots, key=lambda s: s['start_time'])[:1]
+                slot_list = _format_slots_for_user(slots)
+                msg = f"Here is the next available slot for {prov_name}:\n{slot_list}\nWould you like to book this slot?"
+            else:
+                slot_list = _format_slots_for_user(slots)
+                msg = f"Here are the available slots for {prov_name}:\n{slot_list}\nPlease select a slot by its number."
             messages.append({"role": "assistant", "content": msg})
             return state.model_copy(update={
                 "messages": messages, 
@@ -556,12 +670,10 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
 
     else:
         if not content:
-            content = "Sorry, I had trouble processing that. Can you repeat your selection?"
+            content = "Could you confirm your above data?"
         messages.append({"role": "assistant", "content": content})
 
     return state.model_copy(update={"messages": messages})
-
-
 
 
 def new_patient_node(state: AppointmentState) -> AppointmentState:
@@ -630,9 +742,11 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
             system_prompts.append(
             "The patient is registered. Ask them for a start date to search for slots. "
             f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+            "You MUST convert their answer (e.g.,'today', 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
             "Do NOT ask for the number of days. "
-            f"Then, you *must* call `get_slots` with that `start_date`, `days=7`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
+            f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
         )
             tools = [get_slots]
 
@@ -642,6 +756,7 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
         system_prompts.append(
             "The user was shown a list of slots. They will now select one by number or time. "
             f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
+            "If the user asks for the first one, earliest, or just one slot, use '1'."
             "You *must* call `select_slot(selection=...)` with their choice."
         )
         tools = [select_slot]
@@ -742,7 +857,7 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
 
             result = create_patient.invoke(tool_args)
             
-            if "error" in result:
+            if "error" in result and result['error'] is not None:
                 msg = f"I'm sorry, there was an error registering you: {result['error']}. Would you like to try again?"
                 messages.append({"role": "assistant", "content": msg})
                 
@@ -761,18 +876,37 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
             prov_id = tool_args.get("provider_ids", [state.provider])[0]
             prov_name = state.provider_name
             
+            min_time = tool_args.pop("min_time", None)
+            max_time = tool_args.pop("max_time", None)
+            
             tool_args["location_ids"] = [state.location]
             tool_args.setdefault("days", 7) 
 
             slots = get_slots.invoke(tool_args)
+            if min_time or max_time:
+                def get_time(s):
+                    return datetime.fromisoformat(s['start_time']).time()
+                if min_time:
+                    min_t = datetime.strptime(min_time, '%H:%M').time()
+                    slots = [s for s in slots if get_time(s) >= min_t]
+                if max_time:
+                    max_t = datetime.strptime(max_time, '%H:%M').time()
+                    slots = [s for s in slots if get_time(s) <= max_t]
+            
             if not slots:
                 msg = f"I'm sorry, no slots are available for {prov_name} in the next 7 days. Would you like to try again with a different date?"
                 messages.append({"role": "assistant", "content": msg})
               
                 return state.model_copy(update={"messages": messages, "slot_options": []})
 
-            slot_list = _format_slots_for_user(slots)
-            msg = f"Here are the available slots for {prov_name}:\n{slot_list}\nPlease select a slot by its number."
+            is_next_available = any(phrase in state.messages[-1]["content"].lower() for phrase in ["next available", "earliest slot", "soonest slot", "first available", "earliest available", "show one slot", "one slot", "the first one"])
+            if is_next_available and slots:
+                slots = sorted(slots, key=lambda s: s['start_time'])[:1]
+                slot_list = _format_slots_for_user(slots)
+                msg = f"Here is the next available slot for {prov_name}:\n{slot_list}\nWould you like to book this slot?"
+            else:
+                slot_list = _format_slots_for_user(slots)
+                msg = f"Here are the available slots for {prov_name}:\n{slot_list}\nPlease select a slot by its number."
             messages.append({"role": "assistant", "content": msg})
             return state.model_copy(update={
                 "messages": messages, 
@@ -810,7 +944,6 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
         messages.append({"role": "assistant", "content": content})
 
     return state.model_copy(update={"messages": messages})
-
 
 
 
@@ -875,6 +1008,12 @@ def schedule_appointment_node(state: AppointmentState) -> AppointmentState:
                 logging.info(f"Making appointment with payload: {appt_payload}")
                 
                 appt = make_appointment.invoke(appt_payload)
+
+                if "error" in appt and appt['error'] is not None:
+                    msg = f"I'm sorry, there was an error while creating appointment: {appt['error']}. Would you like to try again?"
+                    messages.append({"role": "assistant", "content": msg})
+                    
+                    return state.model_copy(update={"messages": messages, "email": None})
                 
                 msg = f"All set! Your appointment is booked. The ID is: {appt.get('appointment_id', 'N/A')}"
                 messages.append({"role": "assistant", "content": msg})

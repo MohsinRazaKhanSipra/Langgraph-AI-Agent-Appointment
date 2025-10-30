@@ -253,43 +253,55 @@ class NexHealthClient:
         Creates an appointment in the NexHealth system.
         Returns the created appointment details or raises an error.
         """
-        try:
-            # headers = self.get_headers()
-            # payload = {
-            #     "subdomain": self.SUBDOMAIN,
-            #     "patient_id": patient_id,
-            #     "location_id": location_id,
-            #     "provider_id": provider_id,
-            #     "operatory_id": operatory_id,
-            #     "start_time": start_time,
-            #     "appointment_type_id": appointment_type_id
-            # }
+        # try:
 
-            # MOCK RESPONSE (as in original file)
-            return {
-                "appointment_id": 0,
-                "patient_id": patient_id,
-                "location_id": location_id,
-                "provider_id": provider_id,
-                "operatory_id": operatory_id,
-                "start_time": start_time,
-                "status": "confirmed"
-            }
+        headers = self.get_headers()
+        headers["content-type"] = "application/json"
         
-            # response = requests.post(f"{self.NEXHEALTH_BASE_URL}/appointments", headers=headers, json=payload)
-            # response.raise_for_status()
-            # data = response.json().get("data", {})
-            # return {
-            #     "appointment_id": data.get("id"),
-            #     "patient_id": data.get("patient_id"),
-            #     "location_id": data.get("location_id"),
-            #     "provider_id": data.get("provider_id"),
-            #     "operatory_id": data.get("operatory_id"),
-            #     "start_time": data.get("start_time"),
-            #     "status": "confirmed"
-            # }
-        except requests.exceptions.RequestException as e:
-            raise ConnectionError(f"Error creating appointment: {e}")
+        payload = {
+            "appt": {
+                "patient_id": patient_id,
+                "provider_id": provider_id,
+                "start_time": start_time,
+                "operatory_id": operatory_id
+            } 
+        }
+        
+        url = f"{self.NEXHEALTH_BASE_URL}/appointments?subdomain={self.SUBDOMAIN}&location_id={location_id}"
+        
+        response = requests.post(url, json=payload, headers=headers)
+        # response.raise_for_status()
+        resp_json = response.json()
+
+        # If the API returns an error payload like:
+        # {"code": false, "description": null, "data": null, "error": ["..."]}
+        # return a readable error message instead of proceeding.
+        resp_json = response.json()
+
+        err = resp_json.get("error")
+        if err:
+            if isinstance(err, (list, tuple)):
+                err_msg = "; ".join(str(e) for e in err)
+            else:
+                err_msg = str(err)
+            return {'error': err_msg}
+
+        data = resp_json.get("data", {})
+        appt = data.get("appt", {})
+
+        if not appt:
+            raise ConnectionError(f"Unexpected response creating appointment: {resp_json}")
+
+        return {
+            "error": None,
+            "appointment_id": appt.get("id"),
+            "patient_id": appt.get("patient_id"),
+            "provider_id": appt.get("provider_id"),
+            "location_id": appt.get("location_id"),
+            "start_time": appt.get("start_time")
+        }
+    # except requests.exceptions.RequestException as e:
+    #     raise ConnectionError(f"Error creating appointment: {e}")
     
     def view_appointment(
         self,
@@ -375,10 +387,21 @@ class NexHealthClient:
             url = f"{self.NEXHEALTH_BASE_URL}/patients?subdomain={self.SUBDOMAIN}&location_id={location_id}"
             
             response = requests.post(url, json=payload, headers=headers)
-            response.raise_for_status()
+            # response.raise_for_status()
+            resp_json = response.json()
+
+            err = resp_json.get("error")
+            if err:
+                if isinstance(err, (list, tuple)):
+                    err_msg = "; ".join(str(e) for e in err)
+                else:
+                    err_msg = str(err)
+                return {'error': err_msg}
+            
             data = response.json().get("data", {}).get("user", {})
             
             return {
+                "error": None,
                 "id": data.get("id"),
                 "email": data.get("email"),
                 "first_name": data.get("first_name"),
