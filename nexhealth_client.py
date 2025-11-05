@@ -209,7 +209,7 @@ class NexHealthClient:
             headers = self.get_headers()
             params = {
                 "subdomain": self.SUBDOMAIN,
-                "date_of_birth": dob, # CHANGED from date_of_birth
+                "date_of_birth": dob, 
                 "location_id": location_id
             }
             endpoint = f"{self.NEXHEALTH_BASE_URL}/patients"
@@ -229,9 +229,9 @@ class NexHealthClient:
                         "name": patient["name"],
                         "phone": patient_phone,
                         "status": "verified patient",
-                        "location_ids": [location_id], # CHANGED from location_id
-                        "upcoming_appts": patient.get("upcoming_appts", []), # ADDED
-                        "provider_id": patient.get("provider_id") # ADDED
+                        "location_ids": [location_id], 
+                        "upcoming_appts": patient.get("upcoming_appts", []),
+                        "provider_id": patient.get("provider_id") 
                     })
                 elif patient_name == name.lower():
                     result_patients.append({
@@ -239,9 +239,9 @@ class NexHealthClient:
                         "name": patient["name"],
                         "phone": patient_phone,
                         "status": "number not verified",
-                        "location_ids": [location_id], # CHANGED from location_id
-                        "upcoming_appts": patient.get("upcoming_appts", []), # ADDED
-                        "provider_id": patient.get("provider_id") # ADDED
+                        "location_ids": [location_id], 
+                        "upcoming_appts": patient.get("upcoming_appts", []),
+                        "provider_id": patient.get("provider_id") 
                     })
 
             return result_patients if result_patients else "no patient found"
@@ -273,9 +273,7 @@ class NexHealthClient:
         # response.raise_for_status()
         resp_json = response.json()
 
-        # If the API returns an error payload like:
-        # {"code": false, "description": null, "data": null, "error": ["..."]}
-        # return a readable error message instead of proceeding.
+    
         resp_json = response.json()
 
         err = resp_json.get("error")
