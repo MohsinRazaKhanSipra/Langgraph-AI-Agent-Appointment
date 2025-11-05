@@ -47,7 +47,6 @@ class AppointmentState(BaseModel):
     provider_options: Optional[List[Dict]] = Field(default_factory=list)
     slot_options: Optional[List[Dict]] = Field(default_factory=list)
 
-    # New fields for improvements
     preferred_provider: Optional[int] = None
     preferred_provider_name: Optional[str] = None
     awaiting_confirm: Optional[bool] = None
@@ -285,11 +284,13 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
     messages = state.messages
     if not messages or messages[0]["role"] != "system":
         system_prompt = (
-            "You are a helpful assistant for booking appointments at my Health Clinic. "
-            "Your first task is to get the user's full name, phone number, and date of birth (YYYY-MM-DD). "
+            "You are a helpful assistant for booking appointments at my Health Clinic."
+            "Answer the user's questions and when user ask you about booking an appointment then ask him to provide his information like full name, dob, and phone number."
+            "For booking appointment you should ask the user's full name, phone number, and date of birth. Date of birth should be parsed as 'YYYY-MM-DD'. Donot ask the user specific format for date of birth."
+            "Also check if name, dob, and phone number should be provided as null values"
             "Be conversational. If they only provide some information, acknowledge it and ask for what's missing. "
             "You can accumulate information across messages. "
-            "Once you have all three pieces of information from the conversation, you *must* call the `info_getter` tool with the extracted values."
+            "Once you have all three pieces of information from the conversation, you must confirm the user information first like if he needs to update his info or not then you *must* call the `info_getter` tool with the extracted values."
         )
         messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -454,7 +455,7 @@ def _find_selected_location(selection: str, location_options: List[Dict]) -> Opt
     return None
 
 
-def existing_patient_node(state: AppointmentState) -> AppointmentState:
+def appointment_detail_node(state: AppointmentState) -> AppointmentState:
     if state.slot_time:  
         return state
 
@@ -464,7 +465,7 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
     
     if state.awaiting_confirm:
         system_prompts.append(
-            "The user is responding to the confirmation of location and provider. "
+            "First greet and welcome the user {state.name} and tell him to schedule the appointment he have to first confirm is location, provider. The user is responding to the confirmation of location and provider."
             "If they confirm everything, ask for a start date to search for slots. "
             f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
             "Convert their answer (e.g.,'today', 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
@@ -483,8 +484,8 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
             "The user was shown a list of providers. They will now select one by name or number. "
             f"You must map their selection to the correct provider ID from this list:\n{prov_list_str}\n"
             f"Once you have the provider ID, ask them for a start date to search for slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days=7`, and the `provider_ids` list."
+            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
         )
         tools = [get_slots]
 
@@ -495,9 +496,12 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
             "The user was shown a list of slots. They will now select one by number or time. "
             f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
             "If the user asks for the first one, earliest, or just one slot, use '1'."
-            "You *must* call `select_slot(selection=...)` with their choice."
+            "You *must* call `select_slot(selection=...)` with their choice. if user ask some specific time like 9am or 10:30 etc then capture that time. or another slot options then call `select_slot` with that time."
+            f"if user is not happy and ask to search for new slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
         )
-        tools = [select_slot]
+        tools = [select_slot, get_slots]
         
     elif state.location_options and not state.location:
         loc_list_str = "\n".join([f"Number {i+1} ('{l['name']}') is ID {l['id']}" for i, l in enumerate(state.location_options)])
@@ -528,6 +532,8 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
             "You MUST convert their answer (e.g.,'today', 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
             "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
             "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
+            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
             "Then, you *must* call `get_slots` with that `start_date`, `days`, and `provider_ids`=[{state.preferred_provider}]. "
             "If they say no or want other options, call `get_providers`."
         )
@@ -542,6 +548,8 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
             "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
             "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
             "Do NOT ask for the number of days. "
+            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
             f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
         )
         tools = [get_slots]
@@ -676,10 +684,7 @@ def existing_patient_node(state: AppointmentState) -> AppointmentState:
     return state.model_copy(update={"messages": messages})
 
 
-def new_patient_node(state: AppointmentState) -> AppointmentState:
-    if state.slot_time:  
-        return state
-
+def patient_register_node(state: AppointmentState) -> AppointmentState:
     messages = state.messages
     system_prompts = []
     tools = []
@@ -687,8 +692,8 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
 
     if not state.location and not state.location_options:
         system_prompts.append(
-            "Your task is to register a new patient. "
-            "First, you *must* call `get_locations` to show them the options."
+            "First tell your registeration is need because you does not exist in the system."
+            "then after that you *must* call `get_locations` to show them the options."
         )
         tools = [get_locations]
     
@@ -736,35 +741,10 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
             "`provider_id`, `full_name`, `email`, `phone_number`, `date_of_birth`, `location_id`."
         )
         tools = [create_patient]
-
-   
-    elif state.patient_id and not state.slot_options and not state.slot_time:
-            system_prompts.append(
-            "The patient is registered. Ask them for a start date to search for slots. "
-            f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g.,'today', 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
-            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
-            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
-            "Do NOT ask for the number of days. "
-            f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
-        )
-            tools = [get_slots]
-
-
-    elif state.slot_options and not state.slot_time:
-        slot_list_str = "\n".join([f"Number {i+1} is '{s['start_time']}' (Operatory: {s['operatory_id']})" for i, s in enumerate(state.slot_options)])
-        system_prompts.append(
-            "The user was shown a list of slots. They will now select one by number or time. "
-            f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
-            "If the user asks for the first one, earliest, or just one slot, use '1'."
-            "You *must* call `select_slot(selection=...)` with their choice."
-        )
-        tools = [select_slot]
     
-
     else:
         system_prompts.append("Please guide the user to the next step.")
-        tools = [get_locations, get_providers, get_email, create_patient, get_slots, select_slot]
+        tools = [get_locations, get_providers, get_email, create_patient]
 
 
 
@@ -869,74 +849,11 @@ def new_patient_node(state: AppointmentState) -> AppointmentState:
             
             return state.model_copy(update={
                 "messages": messages,
-                "patient_id": str(patient_id), 
+                "patient_id": str(patient_id),
+                "is_existing_patient": True  
             })
 
-        elif tool_name == "get_slots":
-            prov_id = tool_args.get("provider_ids", [state.provider])[0]
-            prov_name = state.provider_name
-            
-            min_time = tool_args.pop("min_time", None)
-            max_time = tool_args.pop("max_time", None)
-            
-            tool_args["location_ids"] = [state.location]
-            tool_args.setdefault("days", 7) 
-
-            slots = get_slots.invoke(tool_args)
-            if min_time or max_time:
-                def get_time(s):
-                    return datetime.fromisoformat(s['start_time']).time()
-                if min_time:
-                    min_t = datetime.strptime(min_time, '%H:%M').time()
-                    slots = [s for s in slots if get_time(s) >= min_t]
-                if max_time:
-                    max_t = datetime.strptime(max_time, '%H:%M').time()
-                    slots = [s for s in slots if get_time(s) <= max_t]
-            
-            if not slots:
-                msg = f"I'm sorry, no slots are available for {prov_name} in the next 7 days. Would you like to try again with a different date?"
-                messages.append({"role": "assistant", "content": msg})
-              
-                return state.model_copy(update={"messages": messages, "slot_options": []})
-
-            is_next_available = any(phrase in state.messages[-1]["content"].lower() for phrase in ["next available", "earliest slot", "soonest slot", "first available", "earliest available", "show one slot", "one slot", "the first one"])
-            if is_next_available and slots:
-                slots = sorted(slots, key=lambda s: s['start_time'])[:1]
-                slot_list = _format_slots_for_user(slots)
-                msg = f"Here is the next available slot for {prov_name}:\n{slot_list}\nWould you like to book this slot?"
-            else:
-                slot_list = _format_slots_for_user(slots)
-                msg = f"Here are the available slots for {prov_name}:\n{slot_list}\nPlease select a slot by its number."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={
-                "messages": messages, 
-                "slot_options": slots
-            })
-
-        elif tool_name == "select_slot":
-            selection = tool_call["args"]["selection"]
-            selected_slot = _find_selected_slot(selection, state.slot_options)
-            
-            if not selected_slot:
-                slot_list = _format_slots_for_user(state.slot_options)
-                msg = f"Sorry, I didn't understand that selection. Please pick from the list:\n{slot_list}"
-                messages.append({"role": "assistant", "content": msg})
-                return state.model_copy(update={"messages": messages})
-
-            try:
-                time_obj = datetime.fromisoformat(selected_slot['start_time'])
-                time_str = time_obj.strftime('%A, %B %d at %I:%M %p')
-            except Exception:
-                time_str = selected_slot['start_time']
-
-            msg = f"Great, I've selected {time_str}."
-            messages.append({"role": "assistant", "content": msg})
-            return state.model_copy(update={
-                "slot_time": selected_slot["start_time"],
-                "operatory_id": selected_slot["operatory_id"],
-                "messages": messages,
-                "slot_options": [] 
-            })
+       
             
     else:
         if not content:
@@ -1041,38 +958,46 @@ def schedule_appointment_node(state: AppointmentState) -> AppointmentState:
 workflow = StateGraph(AppointmentState)
 
 workflow.add_node("patient_info", patient_info_node)
-workflow.add_node("existing_patient", existing_patient_node)
-workflow.add_node("new_patient", new_patient_node)
+workflow.add_node("appointment_detail", appointment_detail_node)
+workflow.add_node("patient_register", patient_register_node)
 workflow.add_node("schedule_appointment", schedule_appointment_node)
 
 workflow.set_entry_point("patient_info")
 
 def decide_patient_path(s: AppointmentState):
     """Decide where to go after patient_info node."""
-    if s.is_existing_patient is True:
-        return "existing_patient"
+    if s.patient_id and s.is_existing_patient:
+        return "appointment_detail"
     if s.is_existing_patient is False:
-        return "new_patient"
+        return "patient_register"
     return END 
 
 workflow.add_conditional_edges("patient_info", decide_patient_path, {
-    "existing_patient": "existing_patient",
-    "new_patient": "new_patient",
+    "appointment_detail": "appointment_detail",
+    "patient_register": "patient_register",
     END: END
 })
 
 def route_to_schedule(s: AppointmentState):
-    """Route to schedule if slot picked; otherwise wait for next user input."""
-    if s.slot_time:
+    """Route to schedule if slot picked."""
+
+    if s.patient_id and s.slot_time:
         return "schedule_appointment"
     return END
 
-workflow.add_conditional_edges("existing_patient", route_to_schedule, {
+def route_to_appointment(s: AppointmentState):
+    """Route to appointment_detail for registered patients."""
+    if s.patient_id and not s.slot_time:
+        return "appointment_detail"
+
+    return END
+
+workflow.add_conditional_edges("appointment_detail", route_to_schedule, {
     "schedule_appointment": "schedule_appointment",
     END: END
 })
-workflow.add_conditional_edges("new_patient", route_to_schedule, {
-    "schedule_appointment": "schedule_appointment",
+workflow.add_conditional_edges("patient_register", route_to_appointment, {
+    "appointment_detail": "appointment_detail",
     END: END
 })
 
@@ -1093,16 +1018,16 @@ def decide_schedule_path(s: AppointmentState):
         
   
     if "missing" in last_msg_content:
-        if s.is_existing_patient:
-            return "existing_patient"
-        return "new_patient"
+        if s.patient_id:
+            return "appointment_detail"
+        return "patient_register"
         
     
     return "schedule_appointment"
 
 workflow.add_conditional_edges("schedule_appointment", decide_schedule_path, {
-    "existing_patient": "existing_patient",
-    "new_patient": "new_patient",
+    "appointment_detail": "appointment_detail",
+    "patient_register": "patient_register",
     "schedule_appointment": "schedule_appointment",
     END: END
 })
