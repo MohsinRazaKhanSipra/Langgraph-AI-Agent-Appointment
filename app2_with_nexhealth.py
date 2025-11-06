@@ -311,20 +311,20 @@ def build_graph():
     graph.add_node("CHECK_AVAIL", availability_node)
     graph.add_node("SCHEDULE", schedule_node)
 
-    # graph.set_entry_point("INTENT")
+    graph.set_entry_point("INTENT")
 
-    # graph.add_conditional_edges(
-    #     "INTENT",
-    #     route_from_intent,
-    #     {
-    #         "ANSWER_KB": "ANSWER_KB",
-    #         "PARSE": "PARSE"
-    #     }
-    # )
+    graph.add_conditional_edges(
+        "INTENT",
+        route_from_intent,
+        {
+            "ANSWER_KB": "ANSWER_KB",
+            "PARSE": "PARSE"
+        }
+    )
 
-    graph.set_entry_point("COLLECT_INFO")
 
-    # graph.add_edge("PARSE", "COLLECT_INFO")
+
+    graph.add_edge("PARSE", "COLLECT_INFO")
 
     graph.add_conditional_edges(
         "COLLECT_INFO",
