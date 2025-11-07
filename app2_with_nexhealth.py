@@ -190,7 +190,16 @@ def route_from_intent(state: State) -> str:
     return "ANSWER_KB" if state.intent == "general_question" else "PARSE"
 
 def answer_kb_node(state: State) -> State:
-    state.result = kb_answer(state.user_message)
+    context = kb_answer(state.user_message)
+    
+    messages = [
+        SystemMessage(content="You are a helpful clinic assistant. Use the context to answer the user's question. Keep the answer friendly and concise."),
+        HumanMessage(content=f"Context: {context}\n\nUser Question: {state.user_message}")
+    ]
+    
+    res = llm.invoke(messages)
+    state.result = res.content
+    
     return state
 
 def parse_node(state: State) -> State:
