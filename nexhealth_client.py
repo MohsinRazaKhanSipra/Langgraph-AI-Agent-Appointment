@@ -414,6 +414,54 @@ class NexHealthClient:
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"Error creating patient: {e}")
         
+    def cancel_appointment(self, appointment_id: int) -> str:
+        """
+        Cancels an appointment via a PATCH request.
+        If the appointment is already cancelled, it returns a success message
+        and avoids throwing an error that stops the reschedule process.
+        """
+        try:
+            headers = self.get_headers()
+            endpoint = f"{self.NEXHEALTH_BASE_URL}/appointments/{appointment_id}"
+            params = {"subdomain": self.SUBDOMAIN}
+            payload = {"appt": {"cancelled": True}}
+
+            response = requests.patch(endpoint, headers=headers, params=params, json=payload)
+            
+            if response.status_code == 200:
+                data = response.json().get("data", {}).get("appt", {})
+             
+                is_cancelled = data.get('cancelled')
+                
+                status = "Cancelled" if is_cancelled else "Not Cancelled"
+                
+                
+                
+                return (
+                    f"\nAppointment {status} Successfully!\n"
+                    f"Appointment ID: {data.get('id', 'N/A')}"
+                )
+
+            elif response.status_code == 400:
+       
+                error_info = response.json()
+                error_list = error_info.get("error", [])
+                already_cancelled_msg = "Cannot update appointment because it is not synced with the PMS and/or a live client"
+                
+                if already_cancelled_msg in error_list and not error_info.get("code", True):
+                     
+                     return f"\nAppointment ID {appointment_id} is **already cancelled** or cannot be updated, but proceeding with new appointment creation for reschedule."
+                
+                error_msg = error_list[0] if error_list else f"Error: {response.text}"
+                return f"\nError: Bad Request received for appointment {appointment_id}. Details: {error_msg}"
+
+            else:
+          
+                return f"\nError: Received status code {response.status_code} while updating appointment {appointment_id}. Details: {response.text}"
+
+        except Exception as e:
+            return f"\nAn exception occurred while updating appointment ID {appointment_id}: {e}"
+        
 
 
 

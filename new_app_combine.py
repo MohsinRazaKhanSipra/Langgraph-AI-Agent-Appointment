@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any, Union
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langchain_core.tools import tool
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from nexhealth_client import NexHealthClient
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -62,13 +62,17 @@ class AppointmentState(BaseModel):
     operatory_id: Optional[int] = None
     slot_time: Optional[str] = None
     appointment_type_id: Optional[int] = 1 
-    upcoming_appt_id: Optional[int] = None
+    upcoming_appts: List[Dict] = Field(default_factory=list)
     location_options: Optional[List[Dict]] = Field(default_factory=list)
     provider_options: Optional[List[Dict]] = Field(default_factory=list)
     slot_options: Optional[List[Dict]] = Field(default_factory=list)
     preferred_provider: Optional[int] = None
     preferred_provider_name: Optional[str] = None
     awaiting_confirm: Optional[bool] = None
+    awaiting_cancel_selection: Optional[bool] = None
+    awaiting_date: Optional[bool] = False  
+    upcoming_options: List[Dict] = Field(default_factory=list)
+    retry_flag: bool = False  
 
 @tool
 def info_getter(name: str, phone_number: str, dob: str) -> dict:
@@ -87,6 +91,7 @@ def search_patient(name: str, phone_number: str, dob: str, location_id: int = 33
 def get_locations() -> List[dict]:
     """Fetch all available locations from NexHealth."""
     return NexHealthClient().get_locations()
+
 
 
 @tool
@@ -184,16 +189,6 @@ def make_appointment(
     return appointment_created
 
 
-@tool
-def view_appointment(
-    appointment_id: Optional[int] = None,
-    location_id: Optional[int] = None,
-    days: int = 10
-) -> Union[str, dict, List[dict]]:
-    """Retrieve appointment by ID or list upcoming ones."""
-    client = NexHealthClient()
-    return client.view_appointment(appointment_id, location_id, days)
-
 
 @tool
 def select_slot(selection: str) -> dict:
@@ -279,16 +274,54 @@ def select_location(selection: str) -> dict:
     return {"selection": selection}
 
 
+@tool
+def cancel_appointment(appointment_id: int) -> dict:
+    """Cancel an appointment by its ID."""
+    client = NexHealthClient()
+    result = client.cancel_appointment(appointment_id)
+    if "successfully" in result.lower() or "already cancelled" in result.lower():
+        return {"success": True, "message": result.strip()}
+    return {"success": False, "message": result.strip()}
+
+@tool
+def view_upcoming_appointments(patient_id: str, location_id: int, days: int = 90) -> List[dict]:
+    """View upcoming appointments for a patient at a location."""
+    client = NexHealthClient()
+    all_appts = client.view_appointment(location_id=location_id, days=days)
+    if not isinstance(all_appts, list):
+        return []
+    return [
+        appt for appt in all_appts
+        if str(appt.get("patient_id")) == str(patient_id)
+        and not appt.get("cancelled", False)
+        and datetime.fromisoformat(appt.get("start_time", "1970-01-01T00:00:00+0000").replace("Z", "+00:00")) > datetime.now(timezone.utc)
+    ]
+
+@tool
+def select_appointment_to_cancel(selection: str) -> dict:
+    """
+    Call this tool when the user has definitively chosen a specific appointment to cancel from the list.
+    'selection' can be the number (e.g., '1', '2') or a string matching the time or ID.
+    """
+    return {"selection": selection}
+
+
 def _get_llm_response(messages: List[Dict], tools: List):
     """Helper function to invoke LLM with retry."""
+    kb_system = {
+        "role": "system",
+        "content": f"Before responding or calling any tools, check if the user's last message is solely a general question about hours, location, insurance, or phone. If yes, answer directly using this knowledge and do not proceed with other tasks or call tools:\nHours: {KB['hours']}\nLocation: {KB['location']}\nInsurance: {KB['insurance']}\nPhone: {KB['phone']}\nIf the query is mixed with other intents or not about these, ignore this instruction and proceed with the node's specific task."
+    }
+    full_messages = [kb_system] + messages
+
     llm_with_tools = llm.bind_tools(tools)
     try:
-        response = llm_with_tools.invoke(messages)
+        response = llm_with_tools.invoke(full_messages)
     except Exception as e:
         if "429" in str(e):
             logging.warning("Quota hit; waiting 60s...")
             time.sleep(60)
-            response = llm_with_tools.invoke(messages) 
+            response = llm_with_tools.invoke(full_messages) 
         else:
             raise e
     return response
@@ -308,6 +341,26 @@ def _format_slots_for_user(slots: List[Dict]) -> str:
             formatted.append(f"{i+1}. {s['start_time']}")
             
     return "\n".join(formatted)
+
+
+def _format_appts_for_user(appts: List[Dict]) -> str:
+    """Helper to format appointments into a user-friendly numbered list."""
+    if not appts:
+        return "No upcoming appointments."
+    
+    formatted = []
+    for i, a in enumerate(appts):
+        try:
+            time_obj = datetime.fromisoformat(a['start_time'].replace("Z", "+00:00"))
+            time_str = time_obj.strftime('%A, %B %d at %I:%M %p')
+            prov_id = a.get('provider_id', 'N/A')
+            formatted.append(f"{i+1}. ID: {a['id']} - {time_str} with Provider {prov_id}")
+        except Exception:
+            formatted.append(f"{i+1}. ID: {a.get('id', 'N/A')} - {a.get('start_time', 'N/A')}")
+            
+    return "\n".join(formatted)
+
+
 
 
 def _find_selected_slot(selection: str, slot_options: List[Dict]) -> Optional[Dict]:
@@ -379,28 +432,62 @@ def _find_selected_location(selection: str, location_options: List[Dict]) -> Opt
     logging.warning(f"Could not match selection '{selection}' to any location.")
     return None
 
-def intent_classifier_node(state: AppointmentState) -> AppointmentState:
-    if state.intent == "appointment_request":
-        return state
+def _find_selected_appt(selection: str, appt_options: List[Dict]) -> Optional[Dict]:
+    """Helper to find an appointment from options based on user's selection (number, time, or ID)."""
+    if not appt_options:
+        return None
         
+    if selection.isdigit():
+        idx = int(selection) - 1
+        if 0 <= idx < len(appt_options):
+            return appt_options[idx]
+            
+    selection_lower = selection.lower()
+    for a in appt_options:
+        if selection_lower == str(a.get('id')).lower() or selection_lower in a.get('start_time', '').lower():
+            return a
+            
+    for i, a in enumerate(appt_options):
+        try:
+            time_obj = datetime.fromisoformat(a['start_time'].replace("Z", "+00:00"))
+            time_str_1 = time_obj.strftime('%A, %B %d at %I:%M %p').lower()
+            time_str_2 = time_obj.strftime('%I:%M %p').lower()
+            if selection_lower in time_str_1 or selection_lower in time_str_2:
+                return a
+        except Exception:
+            continue
+            
+    logging.warning(f"Could not match selection '{selection}' to any appointment.")
+    return None
+
+def intent_classifier_node(state: AppointmentState) -> AppointmentState:
+    last_messages = state.messages[-3:]  
+    context = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in last_messages if m['role'] in ['user', 'assistant']])
     user_message = state.messages[-1]["content"]
 
     messages = [
         SystemMessage(content="You are a JSON-only classification bot. Your *only* output must be valid JSON."),
         HumanMessage(content=f"""
-Classify the user's intent based on their message: "{user_message}"
+            Classify the user's latest intent based on this conversation context:
+            {context}
 
-The possible intents are:
-- "greeting" (for simple hellos, goodbyes, thank yous)
-- "general_question" (for questions about hours, location, insurance, etc.)
-- "appointment_request" (for anything related to booking, changing, or viewing an appointment, or providing personal info like name, phone, dob)
+            The latest user message is: "{user_message}"
 
-Return *only* a valid JSON object in the format:
-{{"intent":"<value>"}}
-""")
-    ]
+            The possible intents are:
+            - "greeting" (for simple hellos, goodbyes, thank yous)
+            - "general_question" (for questions about hours, location, insurance, etc.)
+            - "book_appointment" (for booking or scheduling a new appointment, or providing info in response to booking prompts)
+            - "view_appointments" (for viewing or checking upcoming appointments, or providing info in response to viewing prompts)
+            - "cancel_appointment" (for canceling an existing appointment, or providing info in response to cancel prompts)
+
+            If the message appears to be a response to a previous prompt (e.g., providing name/DOB after being asked), classify it as the ongoing intent from context.
+
+            Return *only* a valid JSON object in the format:
+            {{"intent":"<value>"}}
+            """)
+        ]
     
-    intent = "appointment_request" 
+    intent = "book_appointment" 
     try:
         res = llm.invoke(messages).content
         
@@ -409,13 +496,13 @@ Return *only* a valid JSON object in the format:
         if json_match:
             json_str = json_match.group(0)
             data = json.loads(json_str)
-            intent = data.get("intent", "appointment_request")
+            intent = data.get("intent", "book_appointment")
         else:
-            logging.warning(f"Intent classification response was not JSON: {res}. Defaulting to appointment_request.")
+            logging.warning(f"Intent classification response was not JSON: {res}. Defaulting to book_appointment.")
             
     except Exception as e:
-        logging.warning(f"Intent classification failed: {e}. Response was: {res}. Defaulting to appointment_request.")
-        intent = "appointment_request" 
+        logging.warning(f"Intent classification failed: {e}. Response was: {res}. Defaulting to book_appointment.")
+        intent = "book_appointment" 
 
     state.intent = intent
 
@@ -440,12 +527,14 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
             "Also check if name, dob, and phone number should be provided as null values"
             "Be conversational. If they only provide some information, acknowledge it and ask for what's missing. "
             "You can accumulate information across messages. "
-            "Once you have all three pieces of information from the conversation, you must confirm the user information first like if he needs to update his info or not then you *must* call the `info_getter` tool with the extracted values."
+            "Once you have all three pieces of information from the conversation, output a message asking the user to confirm the details (e.g., 'I have your name as X, phone as Y, DOB as Z. Is this correct?'). Do not call any tool yet."
+            "In the next interaction, if the user's response confirms the details (e.g., 'yes', 'correct'), you *must* call the `info_getter` tool with the extracted values."
+            "If they indicate an update or correction, ask for the specific changes and update the accumulated info before confirming again."
         )
         if not any(m['role'] == 'system' for m in messages):
              messages.insert(0, {"role": "system", "content": system_prompt})
 
-    response = _get_llm_response(messages, [info_getter, search_patient, view_appointment])
+    response = _get_llm_response(messages, [info_getter, search_patient, view_upcoming_appointments])
     content = getattr(response, "content", "")
     tool_calls = getattr(response, "tool_calls", [])
 
@@ -461,22 +550,20 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
         })
 
         if isinstance(search_result, list) and any(p.get("status") == "verified patient" for p in search_result):
-            p = search_result[0]
-            upcoming = p.get("upcoming_appts", [])
-            upcoming_id = upcoming[0]["id"] if upcoming else None
-            loc_id = p["location_ids"][0]
+            p = next(p for p in search_result if p.get("status") == "verified patient")
+            location_id = p["location_ids"][0]
             prov_id = p.get("provider_id")
             
-            loc_name = f"ID: {loc_id}"
+            loc_name = f"ID: {location_id}"
             prov_name = f"ID: {prov_id}" if prov_id else "any provider"
             try:
                 all_locs = get_locations.invoke({})
-                found_loc = next((loc for loc in all_locs if loc['id'] == loc_id), None)
+                found_loc = next((loc for loc in all_locs if loc['id'] == location_id), None)
                 if found_loc:
                     loc_name = found_loc['name']
                 
                 if prov_id:
-                    all_provs = get_providers.invoke({"location_id": loc_id})
+                    all_provs = get_providers.invoke({"location_id": location_id})
                     found_prov = next((prov for prov in all_provs if prov['id'] == prov_id), None)
                     if found_prov:
                         prov_name = found_prov['name']
@@ -484,22 +571,29 @@ def patient_info_node(state: AppointmentState) -> AppointmentState:
                 logging.warning(f"Could not fetch names for existing patient: {e}")
     
 
+            upcoming = view_upcoming_appointments.invoke({
+                "patient_id": str(p["id"]),
+                "location_id": location_id,
+                "days": 90
+            })
+
             state = state.model_copy(update={
                 "patient_id": str(p["id"]),
                 "is_existing_patient": True,
-                "location": loc_id,
+                "location": location_id,
                 "location_name": loc_name,
-                "upcoming_appt_id": upcoming_id,
+                "upcoming_appts": upcoming,
                 "preferred_provider": prov_id,
                 "preferred_provider_name": prov_name,
                 "awaiting_confirm": True
             })
             
             msg = f"Welcome back, {state.name}! Your preferred location is {loc_name}."
-            if upcoming_id:
-                msg += f" I see you have an upcoming appointment (ID: {upcoming_id})."
-            
-            msg += " Let's book your next appointment."
+            num_upcoming = len(upcoming)
+            if num_upcoming > 0:
+                msg += f" I see you have {num_upcoming} upcoming appointment(s). Would you like to view or cancel them, or book a new one?"
+            else:
+                msg += " Let's book your next appointment."
             if prov_id:
                 msg += f" Your preferred provider is {prov_name}. Would you like to book at this location with this provider?"
             else:
@@ -526,96 +620,143 @@ def appointment_detail_node(state: AppointmentState) -> AppointmentState:
     system_prompts = []
     tools = []
     
-    if state.awaiting_confirm:
-        system_prompts.append(
-            "First greet and welcome the user {state.name} and tell him to schedule the appointment he have to first confirm is location, provider. The user is responding to the confirmation of location and provider."
-            "If they confirm everything, ask for a start date to search for slots. "
-            f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "Convert their answer (e.g.,'today', 'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
-            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
-            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
-            "Then, call `get_slots` with `start_date`, `days`, `location_ids`=[{state.location}], `provider_ids`=[{state.preferred_provider}]. "
-            "If they want a different provider, call `get_providers(location_id={state.location})`. "
-            "If they want a different location, call `get_locations()`. "
-        )
-        tools = [get_slots, get_providers, get_locations]
-    
-    if state.provider_options and not state.provider:
-
-        prov_list_str = "\n".join([f"Number {i+1} ('{p['name']}') is ID {p['id']}" for i, p in enumerate(state.provider_options)])
-        system_prompts.append(
-            "The user was shown a list of providers. They will now select one by name or number. "
-            f"You must map their selection to the correct provider ID from this list:\n{prov_list_str}\n"
-            f"Once you have the provider ID, ask them for a start date to search for slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
-        )
-        tools = [get_slots]
-
-    elif state.slot_options and not state.slot_time:
-
-        slot_list_str = "\n".join([f"Number {i+1} is '{s['start_time']}' (Operatory: {s['operatory_id']})" for i, s in enumerate(state.slot_options)])
-        system_prompts.append(
-            "The user was shown a list of slots. They will now select one by number or time. "
-            f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
-            "If the user asks for the first one, earliest, or just one slot, use '1'."
-            "You *must* call `select_slot(selection=...)` with their choice. if user ask some specific time like 9am or 10:30 etc then capture that time. or another slot options then call `select_slot` with that time."
-            f"if user is not happy and ask to search for new slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
-        )
-        tools = [select_slot, get_slots]
+    if state.intent == "view_appointments":
+        upcoming = state.upcoming_appts
+        if not upcoming:
+            upcoming = view_upcoming_appointments.invoke({
+                "patient_id": state.patient_id,
+                "location_id": state.location,
+                "days": 90
+            })
+            state.upcoming_appts = upcoming
         
-    elif state.location_options and not state.location:
-        loc_list_str = "\n".join([f"Number {i+1} ('{l['name']}') is ID {l['id']}" for i, l in enumerate(state.location_options)])
-        system_prompts.append(
-            "The user was shown a list of locations. They will now select one by name or number. "
-            f"You must capture their selection as a string (e.g., '1' or 'Location Name'). Here is the list for your reference:\n{loc_list_str}\n"
-            "You *must* call `select_location(selection=...)` with their choice."
-        )
-        tools = [select_location]
-
-    elif state.provider_options and not state.provider:
-        prov_list_str = "\n".join([f"Number {i+1} ('{p['name']}') is ID {p['id']}" for i, p in enumerate(state.provider_options)])
-        system_prompts.append(
-            "The user was shown a list of providers. They will now select one by name or number. "
-            f"You must capture their selection as a string (e.g., '1' or 'Dr. Smith'). Here is the list for your reference:\n{prov_list_str}\n"
-            "You *must* call `select_provider(selection=...)` with their choice."
-        )
-        tools = [select_provider]
-
-    elif not state.provider:
-     
-        system_prompts.append(
-            "The patient needs to select a provider. "
-            f"Their preferred provider is {state.preferred_provider_name} (ID: {state.preferred_provider}). "
-            "First, ask them if they want to use this provider. "
-            "If they say yes, ask them for a start date to search for slots. "
-            f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g.,'today', 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
-            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
-            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
-            "Then, you *must* call `get_slots` with that `start_date`, `days`, and `provider_ids`=[{state.preferred_provider}]. "
-            "If they say no or want other options, call `get_providers`."
-        )
-        tools = [get_providers, get_slots]
+        formatted = _format_appts_for_user(upcoming)
+        msg = f"Here are your upcoming appointments:\n{formatted}"
+        messages.append({"role": "assistant", "content": msg})
+        return state.model_copy(update={"messages": messages})
     
-    else:
+    elif state.intent == "cancel_appointment":
+        if state.awaiting_cancel_selection:
+            system_prompts.append(
+                "The user is selecting which appointment to cancel from the list shown. "
+                "Capture their selection as a string (e.g., '1' or '9am' or ID). "
+                "Then, call `select_appointment_to_cancel(selection=...)`."
+            )
+            tools = [select_appointment_to_cancel, cancel_appointment]
+        else:
+            upcoming = state.upcoming_appts
+            if not upcoming:
+                upcoming = view_upcoming_appointments.invoke({
+                    "patient_id": state.patient_id,
+                    "location_id": state.location,
+                    "days": 90
+                })
+                state.upcoming_appts = upcoming
+            
+            if not upcoming:
+                msg = "You have no upcoming appointments to cancel."
+                messages.append({"role": "assistant", "content": msg})
+                return state.model_copy(update={"messages": messages})
+            
+            formatted = _format_appts_for_user(upcoming)
+            msg = f"Here are your upcoming appointments:\n{formatted}\nWhich one would you like to cancel? (number, time, or ID)"
+            messages.append({"role": "assistant", "content": msg})
+            state.awaiting_cancel_selection = True
+            state.upcoming_options = upcoming
+            return state.model_copy(update={"messages": messages})
+    
+    elif state.intent == "book_appointment":
+        if state.awaiting_confirm:
+            system_prompts.append(
+                "The user is responding to the confirmation of location and provider."
+                "If the user's message is an affirmation like 'yes' or 'confirm' without a date preference, output a message asking for the preferred date for the appointment (e.g., 'Great! When would you like to book?'). Do not call any tools yet."
+                "If the user's message includes a date preference (e.g., 'yes, tomorrow'), convert it to 'start_date' and 'days', then *must* call `get_slots` with `start_date`, `days`, `location_ids`=[{state.location}], `provider_ids`=[{state.preferred_provider or state.provider}]. "
+                f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+                "Convert answers like 'today', 'tomorrow', 'next week' into 'YYYY-MM-DD' `start_date`. Adjust 'days' (default 7). "
+                "For time filters (e.g., 'after 5pm'), note but handle after fetching slots if needed."
+                "If they want a different provider, call `get_providers(location_id={state.location})`. "
+                "If they want a different location, call `get_locations()`. "
+                "Example: User: yes -> Output: Great! When would you like to book? "
+                "User: yes, tomorrow -> Call get_slots with start_date='tomorrow_date', days=1"
+            )
+            tools = [get_slots, get_providers, get_locations]
+        
+        if state.provider_options and not state.provider:
+
+            prov_list_str = "\n".join([f"Number {i+1} ('{p['name']}') is ID {p['id']}" for i, p in enumerate(state.provider_options)])
+            system_prompts.append(
+                "The user was shown a list of providers. They will now select one by name or number. "
+                f"You must map their selection to the correct provider ID from this list:\n{prov_list_str}\n"
+                f"Once you have the provider ID, ask them for a start date to search for slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+                "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+                "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
+            )
+            tools = [get_slots]
+
+        elif state.slot_options and not state.slot_time:
+
+            slot_list_str = "\n".join([f"Number {i+1} is '{s['start_time']}' (Operatory: {s['operatory_id']})" for i, s in enumerate(state.slot_options)])
+            system_prompts.append(
+                "The user was shown a list of slots. They will now select one by number or time. "
+                f"You must capture their selection as a string (e.g., '1' or '9am'). Here is the list for your reference:\n{slot_list_str}\n"
+                "If the user asks for the first one, earliest, or just one slot, use '1'."
+                "You *must* call `select_slot(selection=...)` with their choice. if user ask some specific time like 9am or 10:30 etc then capture that time. or another slot options then call `select_slot` with that time."
+                f"if user is not happy and ask to search for new slots. Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+                "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+                "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
+            )
+            tools = [select_slot, get_slots]
+            
+        elif state.location_options and not state.location:
+            loc_list_str = "\n".join([f"Number {i+1} ('{l['name']}') is ID {l['id']}" for i, l in enumerate(state.location_options)])
+            system_prompts.append(
+                "The user was shown a list of locations. They will now select one by name or number. "
+                f"You must capture their selection as a string (e.g., '1' or 'Location Name'). Here is the list for your reference:\n{loc_list_str}\n"
+                "You *must* call `select_location(selection=...)` with their choice."
+            )
+            tools = [select_location]
+
+        elif state.provider_options and not state.provider:
+            prov_list_str = "\n".join([f"Number {i+1} ('{p['name']}') is ID {p['id']}" for i, p in enumerate(state.provider_options)])
+            system_prompts.append(
+                "The user was shown a list of providers. They will now select one by name or number. "
+                f"You must capture their selection as a string (e.g., '1' or 'Dr. Smith'). Here is the list for your reference:\n{prov_list_str}\n"
+                "You *must* call `select_provider(selection=...)` with their choice."
+            )
+            tools = [select_provider]
+
+        elif not state.provider:
+         
+            system_prompts.append(
+                "The patient needs to select a provider. "
+                f"Their preferred provider is {state.preferred_provider_name} (ID: {state.preferred_provider}). "
+                "First, ask them if they want to use this provider. "
+                "If they say yes, ask them for a start date to search for slots. "
+                f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+                "You MUST convert their answer (e.g.,'today', 'tomorrow') into a 'YYYY-MM-DD' `start_date`. "
+                "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+                "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
+                "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+                "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
+                "Then, you *must* call `get_slots` with that `start_date`, `days`, and `provider_ids`=[{state.preferred_provider}]. "
+                "If they say no or want other options, call `get_providers`."
+            )
+            tools = [get_providers, get_slots]
+        
+        else:
       
-        system_prompts.append(
-            "The user has confirmed their provider. Ask them for a start date to search for slots. "
-            f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
-            "You MUST convert their answer (e.g.,'today',  'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
-            "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
-            "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
-            "Do NOT ask for the number of days. "
-            "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
-            "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
-            f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
-        )
-        tools = [get_slots]
+            system_prompts.append(
+                "The user has confirmed their provider. Ask them for a start date to search for slots. "
+                f"Today's date is {datetime.now().strftime('%Y-%m-%d')}. "
+                "You MUST convert their answer (e.g.,'today',  'tomorrow', 'next week') into a 'YYYY-MM-DD' `start_date`. "
+                "Adjust 'days' based on request (default 1, e.g., 2 for '2 days', 14 for 'two weeks' for today the days are like 1 etc). "
+                "If time filters (e.g., 'after 5pm'), include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. "
+                "Do NOT ask for the number of days. "
+                "You MUST convert their answer (e.g., 'tomorrow', 'today') into a 'YYYY-MM-DD' `start_date`. If they say show the next available, just use today's date. show single slot. if they ask to show specific slots like after 5pm, include 'min_time': '17:00' and/or 'max_time': 'HH:MM'. if they ask for first 3 slots for this monday or etc, adjust 'days' accordingly (default 7). and show limited slots if user asked for specific number of slots. "
+                "Then, you *must* call `get_slots` with that `start_date`, `days`, and the `provider_ids` list."
+                f"Then, you *must* call `get_slots` with that `start_date`, `days`, `location_ids`=[{state.location}], and `provider_ids`=[{state.provider}]."
+            )
+            tools = [get_slots]
 
    
     if messages[-1]["role"] != "system":
@@ -738,6 +879,32 @@ def appointment_detail_node(state: AppointmentState) -> AppointmentState:
                 "messages": messages,
                 "slot_options": [] 
             })
+        
+        elif tool_name == "select_appointment_to_cancel":
+            selection = tool_args["selection"]
+            selected_appt = _find_selected_appt(selection, state.upcoming_options)
+            
+            if not selected_appt:
+                formatted = _format_appts_for_user(state.upcoming_options)
+                msg = f"Sorry, I didn't understand that selection. Please pick from the list:\n{formatted}"
+                messages.append({"role": "assistant", "content": msg})
+                return state.model_copy(update={"messages": messages})
+            
+            result = cancel_appointment.invoke({"appointment_id": selected_appt["id"]})
+            msg = result["message"]
+            
+           
+            upcoming = view_upcoming_appointments.invoke({
+                "patient_id": state.patient_id,
+                "location_id": state.location,
+                "days": 90
+            })
+            state.upcoming_appts = upcoming
+            state.awaiting_cancel_selection = False
+            state.upcoming_options = []
+            
+            messages.append({"role": "assistant", "content": msg})
+            return state.model_copy(update={"messages": messages})
 
     else:
         if not content:
@@ -751,6 +918,13 @@ def patient_register_node(state: AppointmentState) -> AppointmentState:
     system_prompts = []
     tools = []
 
+
+    if state.retry_flag:
+        system_prompts.append(
+            "The user wants to try registration again after an error. Ask for their full name, phone number, and date of birth anew. "
+            "Be conversational, acknowledge the retry, and accumulate new info without using old details."
+        )
+        state.retry_flag = False
 
     if not state.location and not state.location_options:
         system_prompts.append(
@@ -801,6 +975,7 @@ def patient_register_node(state: AppointmentState) -> AppointmentState:
             "The user has already seen this confirmation. They will now reply 'yes' or 'no'. "
             "If they confirm (e.g., 'yes', 'correct'), you *must* call `create_patient` with all the required arguments: "
             "`provider_id`, `full_name`, `email`, `phone_number`, `date_of_birth`, `location_id`."
+            "If 'no', ask for corrections and update info."
         )
         tools = [create_patient]
     
@@ -903,7 +1078,7 @@ def patient_register_node(state: AppointmentState) -> AppointmentState:
                 msg = f"I'm sorry, there was an error registering you: {result['error']}. Would you like to try again?"
                 messages.append({"role": "assistant", "content": msg})
                 
-                return state.model_copy(update={"messages": messages, "email": None})
+                return state.model_copy(update={"messages": messages, "name": None, "phone_number": None, "dob": None, "email": None, "retry_flag": True})
             
             patient_id = result.get("patient_id")
             msg = f"Great! You are registered with Patient ID: {patient_id}. Let's find an appointment."
@@ -1026,10 +1201,8 @@ workflow.add_node("schedule_appointment", schedule_appointment_node)
 workflow.set_entry_point("intent_classifier")
 
 def route_from_intent(s: AppointmentState):
-    if s.intent == "general_question":
+    if s.intent in ["general_question", "greeting"]:
         return END  
-    elif s.intent == "greeting":
-        return END
     else:
         return "patient_info" 
 
@@ -1129,70 +1302,5 @@ def run_interactive_workflow():
             
             
 if __name__ == "__main__":
-    # run_interactive_workflow()
-    graph=app
-    import nest_asyncio
-    from IPython.display import Image, display
-    from langchain_core.runnables.graph import MermaidDrawMethod
-    import logging
-    import asyncio
-    import sys
-
-    # Apply nest_asyncio to allow Pyppeteer in Jupyter
-    nest_asyncio.apply()
-
-    # Assuming `graph` is defined from your app2.py
-    # Set up logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-    async def draw_graph(graph, output_file="appointment_graph.png", max_retries=5, retry_delay=2.0):
-        try:
-            # Try Mermaid API
-            logging.info("Attempting to draw graph using Mermaid API...")
-            mermaid_syntax = graph.get_graph().draw_mermaid()
-            logging.info(f"Mermaid syntax: {mermaid_syntax}")
-            img = graph.get_graph().draw_mermaid_png(
-                max_retries=max_retries,
-                retry_delay=retry_delay,
-                draw_method=MermaidDrawMethod.API
-            )
-            if img:
-                with open(output_file, "wb") as f:
-                    f.write(img)
-                logging.info(f"Graph saved to {output_file}")
-                return Image(img)
-            else:
-                logging.error("API returned no content.")
-                raise ValueError("API returned no content.")
-        except Exception as e:
-            logging.error(f"API rendering failed: {e}")
-            logging.info("Falling back to Pyppeteer rendering...")
-            try:
-                # Ensure Pyppeteer is installed
-                # !{sys.executable} -m pip install pyppeteer
-                img = await graph.get_graph().draw_mermaid_png_async(
-                    draw_method=MermaidDrawMethod.PYPPETEER,
-                    background_color="white",
-                    padding=10
-                )
-                with open(output_file, "wb") as f:
-                    f.write(img)
-                logging.info(f"Graph saved to {output_file} using Pyppeteer")
-                return Image(img)
-            except Exception as pyppeteer_error:
-                logging.error(f"Pyppeteer rendering failed: {pyppeteer_error}")
-                logging.info("Saving Mermaid syntax for manual inspection...")
-                with open("mermaid_syntax.txt", "w") as f:
-                    f.write(mermaid_syntax)
-                return f"Both rendering methods failed. Mermaid syntax saved to mermaid_syntax.txt. Error: {pyppeteer_error}"
-
-    # Run the async function
-    try:
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(draw_graph(graph, output_file="appointment_graph_combine.png"))
-        display(result)
-    except Exception as e:
-        logging.error(f"Failed to draw graph: {e}")
-
-
+    run_interactive_workflow()
 
